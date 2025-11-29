@@ -1,0 +1,157 @@
+#include <DHT.h>
+#include <LiquidCrystal_I2C.h>
+
+// ------------------- Sensor Pins -------------------
+#define DHTPIN 2
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+#define MQ2_PIN A0
+
+// ------------------- LEDs & Buzzer -------------------
+#define DUAL_RED 8
+#define DUAL_GREEN 9
+#define ORANGE_LED 10
+#define BUZZER 11
+
+// ------------------- LCD -------------------
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ------------------- Thresholds -------------------
+int gasFresh   = 270;  // Fresh <250
+int gasWarning = 290;  // Stale 250-299
+int gasDanger  = 350;  // Rotten >=350
+
+// ------------------- Timing -------------------
+unsigned long lastGasRead = 0;
+unsigned long lastDHTRead = 0;
+unsigned long lastBuzzerToggle = 0;
+
+const long GAS_INTERVAL = 500;    // MQ2 read interval
+const long DHT_INTERVAL = 2000;   // DHT read interval
+const long BUZZER_INTERVAL = 500; // Rotten buzzer blink
+
+// ------------------- Status -------------------
+String currentStatus = "";
+String prevStatus = "";
+bool buzzerState = false;
+
+// ------------------- MQ2 smoothing -------------------
+const int NUM_READINGS = 8;
+int readings[NUM_READINGS];
+int readIndex = 0;
+long total = 0;
+int averageGas = 0;
+
+// ------------------- Hysteresis -------------------
+int consecutiveFresh = 0;
+int consecutiveStale = 0;
+int consecutiveRotten = 0;
+const int stableReadings = 3; // Number of consistent readings before changing status
+
+void setup() {
+  Serial.begin(9600);
+  dht.begin();
+  lcd.init();
+  lcd.backlight();
+
+  pinMode(DUAL_RED, OUTPUT);
+  pinMode(DUAL_GREEN, OUTPUT);
+  pinMode(ORANGE_LED, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+
+  // Initialize smoothing array
+  for (int i = 0; i < NUM_READINGS; i++) readings[i] = 0;
+
+  lcd.setCursor(0, 0);
+  lcd.print("Food Freshness");
+  lcd.setCursor(0, 1);
+  lcd.print("System Starting");
+  delay(2000);
+  lcd.clear();
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+  static float temp = 0, hum = 0;
+
+  // ------------------- Read DHT every 2 sec -------------------
+  if (currentMillis - lastDHTRead >= DHT_INTERVAL) {
+    lastDHTRead = currentMillis;
+    temp = dht.readTemperature();
+    hum = dht.readHumidity();
+  }
+
+  // ------------------- Read MQ2 every 500ms -------------------
+  if (currentMillis - lastGasRead >= GAS_INTERVAL) {
+    lastGasRead = currentMillis;
+
+    int gasValue = analogRead(MQ2_PIN);
+
+    // --- Moving average ---
+    total -= readings[readIndex];
+    readings[readIndex] = gasValue;
+    total += readings[readIndex];
+    readIndex = (readIndex + 1) % NUM_READINGS;
+    averageGas = total / NUM_READINGS;
+
+    // -------- Hysteresis: count consecutive readings --------
+    if (averageGas < gasFresh) {
+      consecutiveFresh++;
+      consecutiveStale = 0;
+      consecutiveRotten = 0;
+    } 
+    else if (averageGas < gasWarning) {
+      consecutiveFresh = 0;
+      consecutiveStale++;
+      consecutiveRotten = 0;
+    } 
+    else {
+      consecutiveFresh = 0;
+      consecutiveStale = 0;
+      consecutiveRotten++;
+    }
+
+    // -------- Determine status only if stable for multiple readings --------
+    if (consecutiveFresh >= stableReadings) currentStatus = "FRESH";
+    else if (consecutiveStale >= stableReadings) currentStatus = "STALE";
+    else if (consecutiveRotten >= stableReadings) currentStatus = "ROTTEN";
+
+    // -------- Update LCD only when status changes --------
+    if (currentStatus != prevStatus) {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Status: " + currentStatus);
+      lcd.setCursor(0, 1);
+      lcd.print("T:");
+      lcd.print(temp);
+      lcd.print(" H:");
+      lcd.print(hum);
+      lcd.print("%");
+      prevStatus = currentStatus;
+    }
+
+    // -------- LED Control --------
+    digitalWrite(DUAL_GREEN, currentStatus == "FRESH" ? HIGH : LOW);
+    digitalWrite(ORANGE_LED, currentStatus == "STALE" ? HIGH : LOW);
+    digitalWrite(DUAL_RED, currentStatus == "ROTTEN" ? HIGH : LOW);
+
+    // -------- Buzzer Control --------
+    if (currentStatus == "ROTTEN") {
+      if (currentMillis - lastBuzzerToggle >= BUZZER_INTERVAL) {
+        lastBuzzerToggle = currentMillis;
+        buzzerState = !buzzerState;
+        digitalWrite(BUZZER, buzzerState);
+      }
+    } else {
+      digitalWrite(BUZZER, LOW);
+      buzzerState = false;
+    }
+
+    // -------- Serial Debug --------
+    Serial.print("Gas: "); Serial.print(averageGas);
+    Serial.print(" | Temp: "); Serial.print(temp);
+    Serial.print(" | Hum: "); Serial.print(hum);
+    Serial.print(" | Status: "); Serial.println(currentStatus);
+  }
+}
